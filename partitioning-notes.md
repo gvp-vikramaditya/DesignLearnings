@@ -1,107 +1,92 @@
 # Partitioning: the Same Word, Three Different Jobs
 
-Partitioning splits data into groups, but the reason matters. These are three common uses, not three mutually exclusive types:
+Partitioning sounds simple: split data into smaller groups. The confusing part is that those groups do different jobs in different systems. A date partition in SQL Server, a folder in a data lake, and a partition key in DynamoDB might look similar, but we shouldn't design them all the same way.
 
-| Where | Main goal |
-| --- | --- |
-| Relational tables, such as SQL Server or Oracle | Manage retention and maintenance; skip irrelevant partitions |
-| Data lakes queried by Spark | Read less data |
-| Distributed databases, such as Cassandra or DynamoDB | Route requests and spread storage and traffic |
+Let's look at three common uses. They overlap, but each starts with a different problem.
 
-## 1. Relational tables: make old data easy to manage
+## 1. In a relational table, make old data easy to manage
 
-Suppose we retain six years of data, with a partition for every six months. Most everyday queries touch recent data, while older partitions remain available for occasional access.
+Say we're keeping six years of billing data, but most everyday queries only care about recent bills. We could divide the table into six-month partitions, keeping the older data available without treating it all as one block for maintenance.
 
-The table is still one logical table. Partitioning does not automatically make every query faster: queries benefit from **partition elimination** when their filters let the database skip irrelevant partitions. Indexes still matter.
+The benefit becomes clear when old data expires. Rather than running a huge `DELETE`, we can retire a whole partition. Oracle supports dropping partitions; SQL Server can truncate a partition or switch it into another table for archiving. The boundaries need to match our retention policy: we can't remove a six-month block until all its data is eligible.
 
-The big operational benefit is retention. Instead of a large `DELETE`, retire a whole expired partition. Oracle supports dropping partitions; SQL Server commonly uses partition switching or truncation. Align boundaries with the retention policy, and remove a partition only when all its data has expired.
+To the application, this is still one table. Queries can also benefit when their filters let the database skip older partitions, which is called **partition elimination**. So the working set can be smaller, but partitioning isn't a shortcut around good indexes.
 
-## 2. Data lakes: avoid reading what the query does not need
+## 2. In a data lake, avoid reading what we don't need
 
-For time-based queries, grouping files by date lets Spark skip unrelated data through **partition pruning**.
+Now imagine the same billing data lives in Parquet files and we're using Spark to analyze it. If a query asks for last Friday's data, we'd rather not read six years of files first.
 
-These object-storage layouts both represent daily partitions:
+Grouping files by date lets Spark skip unrelated partitions. That's **partition pruning**. We might use either of these object-storage layouts:
 
 ```text
 year=2026/month=10/day=07/
 date=2026-10-07/
 ```
 
-More folder levels do not automatically mean finer granularity. An additional hour level would make these hourly partitions.
+Both are daily partitions. The first looks more hierarchical, but it isn't more granular. Adding an hour level would make it hourly.
 
-With ordinary Hive-style folders, queries generally need a filter on the partition columns. A filter on `event_time` alone may not prune a separate `date` column. Iceberg can derive partition filters from its declared timestamp transforms.
+There's a small catch with ordinary Hive-style folders: the query generally needs to filter the partition columns. Filtering `event_time` alone may not tell Spark to prune a separate `date` column.
 
-### Choose granularity from queries and data volume
+### How small should a partition be?
 
-Hourly partitions may help when queries usually read the last few hours, but only if there is enough data per hour. Daily or monthly partitions may work better for lower volumes or wider query ranges.
+If most queries ask for the last two hours, monthly partitions are probably coarser than we'd like. They aren't useless, because file and Parquet row-group statistics may still help skip data. But daily or hourly partitions could narrow the search earlier.
 
-Monthly partitioning is not necessarily useless for an hourly query: file and Parquet row-group statistics may still skip data. It simply provides less precise partition pruning.
+Going finer isn't always better, though. If we barely generate any data per hour, minute-level partitions may just leave us with lots of tiny files.
 
-**Partition size and file size are separate decisions.** One daily partition can contain many files, and many workers can read it. A storage partition is also not the same thing as a Spark execution or shuffle partition.
+It helps to separate two decisions: **how we group data and how large we make each file**. A daily partition can contain many files, read by many workers. It isn't the same thing as a Spark execution or shuffle partition.
 
-### Why small files are expensive
+### Why do small files cause overhead?
 
-Reading thousands of tiny files adds work beyond reading their bytes:
+Spark does more than read the bytes. It has to discover files, track metadata, open files, make storage requests, and read headers or footers. It also spends time planning and scheduling the work. With thousands of tiny files, that overhead can outweigh the useful processing.
 
-- Discovering files, listing directories or object keys, and tracking metadata.
-- Opening each file, making storage requests, and reading file headers or footers.
-- Planning and scheduling work, sometimes spending more time on overhead than useful processing.
+Spark can group small files into one task, so it isn't necessarily one task per file. But each file still has a cost.
 
-Spark can group small files into a task, so one file does not necessarily mean one task. That still does not eliminate per-file overhead.
+### Streaming makes this trade-off more obvious
 
-### Batch writes, streaming, and compaction
+A daily ETL job has a whole day's data to work with, so it can write several reasonably sized files into that day's partition. We don't need exactly one file; a few hundred MB per file is a common starting point, not a rule.
 
-A daily ETL job can write several reasonably sized files into one daily partition. It need not produce exactly one file. A few hundred MB per file is a useful starting point for many analytics workloads, not a universal target.
+With a Kafka stream, we may want fresh data every ten or twenty seconds. Frequent micro-batches and parallel writers can then produce small files. This isn't because a writer must hold an entire target-sized file in memory; buffering and flushing depend on the implementation. We're balancing freshness against file size.
 
-Streaming prioritizes freshness. Frequent micro-batches and parallel writers can produce small files even inside a daily partition. Writers do not need to hold an entire target-sized file in memory; buffering, batch size, and flush behavior depend on the implementation.
+One practical answer is to write promptly, then periodically combine small files. This is **compaction**: rewriting them into larger files, usually within each partition, without changing the logical rows. Some engines can automate it.
 
-**Compaction** rewrites small files into larger ones, usually within each partition. Run it periodically or use supported automatic compaction. It improves the file layout without changing the logical rows.
+## 3. In a distributed database, don't send all the traffic to one place
 
-## 3. Distributed databases: avoid concentrating all the traffic
-
-A partition key helps route requests to the responsible storage shards or replicas. It is not a physical node ID.
-
-In DynamoDB, an item lookup needs the full primary key: the partition key and, if defined, the sort key. Cassandra similarly uses partition-key columns to locate data and clustering columns to organize rows within a partition.
-
-Consider billing events keyed like this:
+Now let's try that date-based design in DynamoDB:
 
 ```text
 Partition key: date
 Sort key:      timestamp + event ID
 ```
 
-This makes "read today's events" convenient, but all new writes target today's key. Recent-data queries also concentrate there. The rest of the database may have spare capacity while that key becomes a **hot partition**.
+It looks convenient. To read today's events, we know which key to query. But today's incoming events all target that same key, and recent-data queries concentrate there too. We can end up with a **hot partition** while the rest of the database has spare capacity.
 
-A date-only key is not always wrong; it can work at modest volumes. At high volumes, consider:
+Here, the partition key helps route requests to the responsible storage shards or replicas; it isn't a physical server ID. A DynamoDB item lookup needs the full primary key, including the sort key when defined. Cassandra similarly routes by partition-key columns and organizes rows within a partition using clustering columns.
 
-- **Entity plus time bucket**, such as customer ID plus month, when queries are customer-specific. A very busy customer can still be hot.
-- **Time bucket plus shard**, such as date plus a stable hash-derived shard number, to spread a day's traffic across multiple keys.
+A date-only key isn't always wrong. At modest volumes, it may be enough. If we usually query one customer's bills, customer ID plus month may fit better, although one very busy customer can still become hot. Another option is date plus a stable hash-derived shard number, spreading a day's traffic across several keys.
 
-Sharding trades write distribution for read complexity. A time-range query must query the relevant buckets and shards, filter by the sort key, and combine the results. Choose enough shards for expected traffic without creating unnecessary fan-out.
+That extra distribution has a price: reading a time range now means querying the relevant buckets and shards and combining the results. We want enough shards to handle the traffic, not so many that every read becomes expensive.
 
-This differs from a lake: Spark can spread one date's files across many workers, while a database shard has serving limits. Some databases also separate compute and storage, so physical co-location is not the deciding factor. **What matters is how traffic is distributed and where the limits are.**
+This is why the lake design doesn't transfer directly. Spark can read one date's files using many workers, while a database shard has serving limits. Some databases also separate compute and storage, so the key distinction isn't physical co-location. It's **where the requests go and how much traffic that destination can handle**.
 
-## 4. What Delta Lake and Iceberg add
+## Where Delta Lake and Iceberg fit
 
-A data lake is the storage environment. **Delta Lake and Apache Iceberg are table formats**, commonly used over Parquet files.
+Back in the lake, compaction introduces another problem: we need to replace files without readers seeing a half-finished change. A writer might also crash after writing some files but before finishing the batch.
 
-They track which files belong to the table through metadata and committed versions, rather than treating every file in a folder as valid data. They provide:
+**Delta Lake and Iceberg are table formats**, commonly used over Parquet files, that manage this through metadata and commits. Readers see a committed version of the table, not simply whatever files happen to be in a folder. Failed writes can leave unreferenced files for cleanup; safe retries still need appropriate checkpointing or idempotency.
 
-- **Atomic commits and consistent reads.** Files become visible through a successful table commit. A failed write may leave unreferenced files for later cleanup, rather than exposing a half-written table. Safe retries still require suitable checkpointing or idempotency.
-- **Data skipping.** Partition information and statistics, such as minimum and maximum values, help skip files. These are not automatically general-purpose secondary indexes.
-- **Maintenance through supported engines.** Compaction, updates, deletes, and merges avoid much custom file-management code. Delta's `OPTIMIZE`, for example, compacts small files.
+Their metadata also helps skip files using partition information and statistics such as minimum and maximum values. Think of this as avoiding unnecessary reads, not automatically getting database-style secondary indexes. Through supported engines, we also get compaction, updates, deletes, and merges without writing all the file-management code ourselves. Delta's `OPTIMIZE`, for example, compacts small files.
 
-Folder layouts can already partition by multiple columns; adding another dimension is not impossible. Changing an existing layout, however, usually requires rewriting data and updating table definitions. Iceberg supports **partition evolution**: new writes use the new layout while old files remain readable under their original layout. That does not reorganize old data automatically, and Delta's layout-changing capabilities are not identical.
+Iceberg also helps when our partitioning needs change. Folders can already partition by multiple columns, but changing an existing layout usually means rewriting data and updating definitions. With **partition evolution**, new writes can use a new layout while old files remain readable under their original one. Changing the partition spec doesn't reorganize old files, and Delta has different layout-changing capabilities. Iceberg's timestamp transforms also let it derive partition filters from time predicates.
 
-### Deleting sensitive data needs a second step
+### Deleting a row isn't always erasing it
 
-A table-level `DELETE` is not necessarily physical erasure. Old versions may retain the data, and delete markers can hide rows without rewriting their files.
+Suppose a secret accidentally lands in the lake. A table-level `DELETE` can hide it from current queries, but old versions or files may still contain it.
 
-For actual removal, use the format's supported rewrite/purge and cleanup operations: for example, Delta purge where needed followed by `VACUUM`, or Iceberg rewrites and snapshot expiration with file cleanup. Respect retention and active readers, and account for backups and object-store versions. If a leaked value is a credential, rotate it too.
+Actual removal needs the format's supported purge and cleanup process: Delta purge where needed followed by `VACUUM`, or Iceberg rewrites and snapshot expiration with file cleanup. We still have to account for retention, active readers, backups, and object-store versions. If the secret is a credential, rotate it too.
 
 ## The takeaway
 
-Choose partitions around **query patterns, write volume, and retention**. Then separately tune file sizes for analytics or key distribution for databases. A convenient date boundary does not guarantee an efficient design.
+Start with what we want partitioning to do: retire old data, skip unnecessary reads, or spread traffic. Then choose the layout around the queries, write volume, and retention policy. A date boundary is convenient, but convenience alone doesn't make it a good partition key.
 
 ## References
 
